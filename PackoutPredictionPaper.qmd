@@ -1,0 +1,974 @@
+```{r}
+#| label: initialisation
+#| message: false
+#| warning: false
+#| echo: false
+
+library(tidyverse)
+library(flextable)
+
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+source("../CommonFunctions/getSQL.r")
+
+```
+
+## Introduction
+
+Fruit yield (packout) prediction is an important measurement for Rockit™ apple as it enables the estimation of product available for sale to customers and thus revenue and profitability. Fruit yield is very complex to predict, *a priori*. It is inherently non-linear and is affected by many different factors including: growing conditions, climate, harvest timing, storage and shipping. The key variables may be difficult to understand and measure.
+
+One approach to predicting packout is through a multivariate model which uses modern supervised learning approaches to determine a quantitative outcome for yield (or any other dependent variable of interest) based on a relevant set of predictor variables. Depending on the method selected the model can provide good accuracy of prediction as well as good inference into the underlying drivers of the model. The advantages with this type of apporach is that it incorporates a range of predictor variables which, if properly fitted, will explain the model for a broad range of conditions. The disadvantage of the machine learning approach is the complexity of assembling and configuring the model.
+
+An alternative method is to observe historical data and apply a best fit curve to the data using an appropriate regression method (heuristic approach). The advantage with this apporach is it is simple and relatively easy to configure. The disadvantage is that it generally relies on one (or a small set) of predictor variables and may not explain the underlying variance for all conditions.
+
+Despite the limitation of the heuristic will be used for the following analysis.
+
+## A heuristic approach to modeling packout for Rockit™ apples
+
+### Regular atmosphere (RA)
+
+Based on six years of observation packout (yield), when stored in regular atmosphere, as a function of storage days is given by @eq-pomod.
+
+$$\Upsilon[\tau]=\alpha e^{\beta \tau} + \theta$$ {#eq-pomod}
+
+Where:
+
+$\Upsilon$ = yield (packout as a %)  
+$\alpha$ = amount the packout declines from the starting value to the asymptote  
+$\beta$ = rate of decline of packout  
+$\tau$ = storage days  
+$\theta$ = asymptotic value of packout  
+
+The curve can be fitted using non-linear least squares regression using the R base stats programme. Confidence intervals are calculated using boot-strapping and the NLSBoot package in R.
+
+### Controlled atmosphere (CA)
+
+CA fruit behaves quite differently to fruit stored in regular atmosphere (RA). CA rooms are typically small and contain suffient apples for one or two days of packing. Because CA rooms are opened sequentially, there is very little deterioration in primary packout observed over the CA packing period. Historically CA packouts have been modeled as constant (i.e. they do not change as a function of storage days). Typically there is an uplift from the final RA packout to the CA packout.
+
+### Using 2024 packout data as an example
+
+The 2004 packing data set provides a good example of the model described above.  The following section uses the 2024 packout data to explain the application of the approach to an actual data set.
+
+```{r}
+#| label: fig-Model2024
+#| fig-cap: "Packout as a function for storage days and storage type for all batches packed at Te Ipu in 2024"
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 0.7
+
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+GBD <- DBI::dbGetQuery(con, getSQL("SQLfiles/GBDModel.sql"))
+
+DBI::dbDisconnect(con)
+
+
+
+########################################################################
+#                       2024 RA Calculation (Te Ipu Only)              #
+########################################################################
+#
+# Extract the RA data
+#
+GBDTIRA <- GBD |>
+  filter(`Packing site` == "Te Ipu Packhouse (RO)",
+         `Storage type` == "RA",
+         Season == 2024,
+         !is.na(RejectKgs)) |>
+  mutate(StorageDays = as.integer(PackDate-gbHarvestDate),
+         Packout = 1-RejectKgs/InputKgs) 
+#
+# Run model
+#
+NLmodel2024 <- nls(Packout ~ alpha *exp(beta * StorageDays) + theta, 
+                   data=GBDTIRA, 
+                   start=list(alpha=0.2, beta=-.05, theta=0.70))
+
+#summary(NLmodel2024)
+#
+# Calculate confidence interval using bootstrapping
+#
+yieldbootPO <- nlstools::nlsBoot(NLmodel2024)
+meanPO2024 <- data.frame(estimate = predict(NLmodel2024,
+                                            newdata = GBDTIRA))
+CIPO2024 <- data.frame(nlstools::nlsBootPredict(yieldbootPO, 
+                                                newdata = GBDTIRA, 
+                                                interval = "confidence"))
+#
+# Assemble RA data frame
+#
+mean_curvePO2024RA <- GBDTIRA |>
+  bind_cols(meanPO2024) |>
+  bind_cols(CIPO2024) |>
+  rename(low = X2.5.,
+         high = X97.5.) |>
+  select(-Median) |>
+  mutate(Season = 2024)
+
+########################################################################
+#                       2024 CA Calculation (Te Ipu Only)              #
+########################################################################
+
+GBDTICA <- GBD |>
+  filter(`Packing site` == "Te Ipu Packhouse (RO)",
+         `Storage type` == "CA",
+         Season == 2024,
+         !is.na(RejectKgs)) |>
+  mutate(StorageDays = as.integer(PackDate-gbHarvestDate),
+         Packout = 1-RejectKgs/InputKgs) 
+#
+# Apply a linear model to the data
+#
+CALModel2024 <- lm(Packout~StorageDays, data = GBDTICA)
+
+#summary(CALModel2024)
+
+predCA2024 <- as_tibble(predict(CALModel2024, newdata = GBDTICA, interval = "confidence")) |>
+  rename(estimate = fit,
+         low = lwr,
+         high = upr)
+
+mean_curvePO2024CA <- GBDTICA |>
+  bind_cols(predCA2024) |>
+  mutate(Season = as.numeric(Season))
+
+################################################################################
+#              Aggregate the CA and RA protions together                       #
+################################################################################
+
+mean_curvePO2024 <- mean_curvePO2024RA |>
+  bind_rows(mean_curvePO2024CA)
+
+mean_curvePO2024 |>
+  filter(`Packing site` == "Te Ipu Packhouse (RO)",
+         !(StorageDays < 50 & `Storage type` == "CA")) |>
+  mutate(StorageDays = as.integer(PackDate-gbHarvestDate),
+         Packout = 1-RejectKgs/InputKgs) |>
+  ggplot() +
+  geom_point(aes(StorageDays, Packout, colour=`Storage type`), alpha = 0.5) +
+  geom_line(aes(x=StorageDays, y=estimate, colour=`Storage type`), linewidth=1) +
+  geom_ribbon(aes(x=StorageDays, ymin=low, ymax=high, groups=`Storage type`),fill="grey50", alpha=0.5) +
+  scale_y_continuous(labels = scales::label_percent(1.0)) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(legend.position = "top",
+        axis.title.x = element_text(margin = margin(t = 10), size = 9),
+        axis.title.y = element_text(margin = margin(r = 10), size = 9),
+        axis.text.y = element_text(size = 9, hjust=1),
+        axis.text.x = element_text(size = 9),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        legend.text = element_text(size = 9),
+        legend.title = element_text(size = 9),
+        strip.text = element_text(margin = margin(b=10), size = 9))
+
+```
+The individual batches are plotted on @fig-Model2024, with RA fruit in green and CA fruit in red.  The modeled packouts are overlaid as the solid lines and the corresponding confidence intervals shown as grey shaded area around each model line. Note the large overlap between the CA and RA packing in terms of storage days for 2024.   
+
+```{r}
+#| label: tbl-RARegression
+#| tbl-cap: "Results for non-linear regression of 2024 regular atmosphere (RA) data"
+
+broom::tidy(NLmodel2024) |>
+  mutate(across(.cols = c(estimate:statistic),~round(.,3)),
+         Significance = case_when(p.value <= 0.05 & p.value > 0.01 ~ "*",
+                                  p.value <= 0.01 & p.value > 0.001 ~ "**",
+                                  p.value <= 0.001 ~ "***",
+                                  TRUE ~ "NS"),
+         p.value = scales::scientific(p.value,3),
+         Coefficient = c("α", "β", "θ")) |>
+  select(-c(term, std.error, statistic)) |>
+  relocate(Coefficient, .before = estimate) |>
+  flextable::flextable() |>
+  flextable::footnote(j="Significance", part = "header", 
+                      value = flextable::as_paragraph("NS = not significant, * = P < 5%, ** = P < 1%, *** = P < 0.1%")) |>
+  flextable::fontsize(size = 8, part="footer") |>
+  flextable::bold(bold = T, part = "header") |>
+  flextable::fontsize(size = 9, part="header") |>
+  flextable::fontsize(size = 9, part="body") |>
+  flextable::autofit()
+  
+
+
+
+```
+
+
+```{r}
+#| label: tbl-CARegression
+#| tbl-cap: "Results for the linear regression of 2024 controlled atmosphere (CA) data"
+
+broom::tidy(CALModel2024) |>
+  select(-c(term, std.error, statistic)) |>
+  mutate(estimate = round(estimate,3),
+         Significance = case_when(p.value <= 0.05 & p.value > 0.01 ~ "*",
+                                  p.value <= 0.01 & p.value > 0.001 ~ "**",
+                                  p.value <= 0.001 ~ "***",
+                                  TRUE ~ "NS"),
+         p.value = scales::scientific(p.value,3),
+         Coefficient = c("Intercept","Slope")) |>
+  relocate(Coefficient, .before = estimate) |>
+  flextable::flextable() |>
+  flextable::footnote(j="Significance", part = "header", 
+                      value = flextable::as_paragraph("NS = not significant, * = P < 5%, ** = P < 1%, *** = P < 0.1%")) |>
+  flextable::fontsize(size = 8, part="footer") |>
+  flextable::bold(bold = T, part = "header") |>
+  flextable::autofit()
+
+```
+
+In terms of the quality of the model, the summaries are presented in tables [-@tbl-RARegression] and [-@tbl-CARegression]. For the non-linear regression (@tbl-RARegression) all the coefficents are significant and the model fit is relatively good.  The number of storage days to get to within 1% of θ is `r round((log(0.01*broom::tidy(NLmodel2024)[[3,2]])-log(broom::tidy(NLmodel2024)[[1,2]]))/broom::tidy(NLmodel2024)[[2,2]],0)` days which is a measure of the rate of decline in packout with storage days.
+
+The assumption for the packout behaviour of the CA fruit is that it is constant for the period of packing. @Tbl-CARegression validates this assumption with the linear model showing a zero slope and moreover without any statisical significance (i.e. the hypothesis that the slope is zero cannot be rejected).  The CA uplift is generally defined as the difference between the CA packout (assumed as constant) and the final RA packout (taken as θ for the case of 2024).  This can be calculated as `r scales::percent(broom::tidy(CALModel2024)[[1,2]]-broom::tidy(NLmodel2024)[[3,2]],0.01)` and is close to the long term mean uplift of 4%.
+
+## Analysis of 2025 data
+
+The above approach can be applied to the 2025 data set before packing has been completed, recognising that there will be increased uncertainty in the model where there is no actual data. From a model perspective the season can be divided into three periods:
+
+1. Fruit already packed 
+2. RA fruit to be packed 
+3. CA fruit to be packed 
+
+### Assumptions for the 2025 model
+
+1. Model coefficients are calculated using existing data.  Uncertainty can be quantified using confidence intervals (calculated using bootstrap methods). 
+2. CA packout will be assumed to be constant and based on the long term mean uplift of 4% (described above).  The CA uplift baseline will be taken as the estimated (i.e. expected value) final RA packout from the non-linear model.
+3. Input mass (kg) of fruit to be packed will be calculated by the product of the number of bins and the weighted mean bin mass.
+4. The future packing programme will be taken from the latest view of S&OP.  This is detailed below. 
+5. The pack dates and packouts are evaluated weekly (based on weekly bins packed) and the storage days are calculated from weighted average harvest dates for each of the storage types (CA & RA).  
+
+The three compenents described above are assembled and a final estimated seasonal packout is predicted.
+
+
+
+```{r}
+#| label: dataExtraction
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+BinsTipped <- DBI::dbGetQuery(con, getSQL("../PackoutPrediction2025/SQLfiles/BinsTipped.sql"))
+
+BinsToGo <- DBI::dbGetQuery(con, getSQL("../PackoutPrediction2025/SQLfiles/BinsToGo.sql"))
+
+SeasonBins <- DBI::dbGetQuery(con, getSQL("../PackoutPrediction2025/SQLfiles/SeasonsBins.sql"))
+
+DBI::dbDisconnect(con)
+#
+# integrate the SF data via ExternalRun
+#
+SFBins <- read_csv("../PackoutPrediction2025/data/Unpacked_20250625083843.csv", show_col_types = F) |>
+  mutate(HarvestDate = as.Date(HarvestDate, "%d/%m/%Y"),
+         `Storage type` = case_when(StorageType == "F" ~ "CA",
+                                    StorageType == "S" ~ "RA",
+                                    TRUE ~ StorageType)) |>
+  filter(BinType == "Inwards Bin",
+         !is.na(Run))
+
+InwardsBinsByRun <- SFBins |>
+  group_by(`Storage type`, Run) |>
+  summarise(NoOfBins = sum(Bins),
+            KGs = sum(Bins*KGs),
+            .groups = "drop") |>
+  rename(STSF = `Storage type`)
+
+BinsTippedFinal <- BinsTipped |>
+  left_join(InwardsBinsByRun, by = c("ExternalRun" = "Run")) |>
+  mutate(`Storage type` = if_else(StorageTypeID == 4, "CA", "RA"),
+         `Storage type` = coalesce(`Storage type`,STSF)) |>
+  select(-c(StorageTypeID, STSF,NoOfBins,KGs,ExternalRun))
+  
+BinsTippedFinalSummary <- BinsTippedFinal |>
+  ungroup() |>
+  group_by(`Packing site`,`Storage type`) |>
+  summarise(BinsTipped = sum(BinsTipped),
+            InputKgs = sum(InputKgs),
+            RejectKgs = sum(RejectKgs),
+            .groups = "drop") |>
+  select(-c(`Storage type`))
+  #pivot_wider(id cols = `Packing site`,
+  #            names_from = `Storage type`,
+  #            values_from = c(BinsTipped, InputKgs, RejectKgs))
+
+BinsTippedFinalSummaryTotal <- BinsTippedFinalSummary |>
+  summarise(BinsTipped = sum(BinsTipped),
+            InputKgs = sum(InputKgs),
+            RejectKgs = sum(RejectKgs),
+            .groups = "drop") |>
+  mutate(`Packing site` = "Total") |>
+  relocate(`Packing site`, .before = BinsTipped)
+
+WAHarvestDate <- BinsToGo |>
+  mutate(`Storage type` = if_else(StorageTypeID == 4, "CA", "RA")) |>
+  select(-StorageTypeID) |>
+  group_by(`Storage type`) |>
+  summarise(HarvestDate = weighted.mean(HarvestDate, BinsToGo),
+            BinsToGo = sum(BinsToGo))
+
+WAMassPerBin <- BinsTippedFinalSummaryTotal |>
+  mutate(MassPerBin = InputKgs/BinsTipped) |>
+  select(MassPerBin)
+
+BinsToGoSummary <- BinsToGo |>
+  mutate(`Storage type` = if_else(StorageTypeID == 4,"CA","RA")) |>
+  group_by(`Storage type`,`Storage site`) |>
+  summarise(BinsToGo = sum(BinsToGo),
+            .groups = "drop") |>
+  pivot_wider(id_cols = `Storage site`,
+              names_from = `Storage type`,
+              values_from = BinsToGo) 
+
+BinsToGoSummaryTotal <- BinsToGoSummary |>
+  summarise(CA = sum(CA),
+            RA = sum(RA)) |>
+  mutate(`Storage site` = "Total") |>
+  relocate(`Storage site`, .before = CA)
+
+```
+
+### Determination of the mean bin mass and harvest date
+
+For the calculation of input mass of fruit yet to be packed, the number of bins is multiplied by the mean mass per bin which is determined by dividing the total input mass of fruit packed in 2025 by the number of bins tipped.  The gives a mean bin mass of `r round(WAMassPerBin[[1,1]],1)` kgs.
+
+Storage days are also required for the model (independent variable) for bins that have yet to be packed.  While a future pack date can be specified the storage days also requires a harvest date (storage days is defined as pack date - harvest date).  For this a weighted mean harvest date can be determined from the all the bins to be packed.  A separate harvest date for CA and RA are calculated and presented in @tbl-WAHarvestDates.  Note there are `r round(as.numeric(WAHarvestDate[[2,2]]-WAHarvestDate[[1,2]]),0)` days difference between the two dates which will impact the storage days for each storage type.
+
+```{r}
+#| label: tbl-WAHarvestDates
+#| tbl-cap: "Weighted average harvest date for all bins to be packed in 2025 (as of 04 Jul) by storage type"
+
+WAHarvestDate |>
+  select(c(`Storage type`,HarvestDate)) |>
+  rename(`Harvest date` = HarvestDate) |>
+  flextable::flextable() |>
+  flextable::bold(bold=T, part="header") |>
+  flextable::autofit()
+  
+
+```
+
+
+### Status of packing at the time of the report
+
+```{r}
+#| label: tbl-binStatus
+#| tbl-cap: "Bins packed and to be packed by storage type in 2025 at 03 Jul 2025"
+
+
+
+BinsTippedFinalSummary |>
+  bind_rows(BinsTippedFinalSummaryTotal) |>
+  rename(`Bins tipped` = BinsTipped,
+         Input_tonnes = InputKgs,
+         Reject_tonnes = RejectKgs) |>
+  mutate(Packout = 1-Reject_tonnes/Input_tonnes,
+         `Bins tipped` = scales::comma(`Bins tipped`, 1.0),
+         across(.cols = c(Input_tonnes:Reject_tonnes),~scales::comma(./1000,0.1)),
+         Packout = scales::percent(Packout, 0.01)) |>
+  flextable::flextable() |>
+  flextable::separate_header() |>
+  flextable::hline(i=2) |>
+  flextable::bold(i=3, bold=T) |>
+  flextable::bold(bold=T, part = "header") |>
+  flextable::align(j=c(2:5), align="right", part="body") |>
+  flextable::align(j=c(2:5), align="center", part="header") |>
+  flextable::autofit()
+
+```
+
+```{r}
+#| label: tbl-BinsToGo
+#| tbl-cap: "Field bins cuurently in storage waiting to be processed as of 03 Jul 2025"
+
+
+  
+BinsToGoSummary |>
+  bind_rows(BinsToGoSummaryTotal) |>
+  flextable::flextable() |>
+  flextable::bold(i=6, bold=T) |>
+  flextable::bold(bold = T, part="header") |>
+  flextable::hline(i=5) |>
+  flextable::autofit()
+
+
+
+```
+
+### Packing programme
+
+A packing programme for the rest of the season was suuplied by S&OP and gives the weekly bins tipped by packing facility (i.e. Te Ipu, Sunfruit and Kiwi Crunch).  The packing plan is presented as a bar chart in @fig-PackProgramme1.
+
+### Packing scenarios 
+
+Based on fruit quality risk and market demand three different packing scenarios have recently been proposed.  A key aim of this analysis is to attempt to model each scenario in terms of overall packout and the timing of the packing programme (i.e. transition from RA to CA and the estimated date of final packing). The three scenarios are:
+
+1. Base ~ all bins are packed (`r scales::comma(SeasonBins[[1]],1.0)`) 
+2. Base ~ 8,000 - 8,000 RA bins are removed from the Rockit™ apple export channel 
+3. Base ~ 10,000 - 10,000 RA bins are removed from the  Rockit™ apple export channel 
+
+The draw down of both RA and CA bins is shown schematically in @fig-ScenarioPacking for each of the three scenarios
+
+```{r}
+#| label: fig-PackProgramme1
+#| fig-cap: "Future pack programme by week and packing site for the remainder of the 2025 season"
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 0.7
+
+SiteTipProgramme <- tibble(isoweek = c(seq(from = 27, to = 50)),
+                        BinsTeIpu = c(rep(575,9),1410,1175,rep(1410,5),940,940,rep(1410,6)),
+                        BinsSunfruit = c(rep(0,7),1250,0,0,900,0,900,0,900,0,975,0,0,rep(1250,5)),
+                        BinsKiwiCrunch = c(700,0,0,585,0,0,585,0,585,rep(0,15))) |>
+  rowwise() |>
+  mutate(TotalBins = sum(c_across(BinsTeIpu:BinsKiwiCrunch)),
+         RABinsTipped = 0,
+         RemainingRABins = 0,
+         CABinsTipped = 0,
+         RemainingCABins = 0)
+
+SiteTipProgrammeLong <- SiteTipProgramme |>
+  rename(`Te Ipu` = BinsTeIpu,
+         Sunfruit = BinsSunfruit,
+         `Kiwi Crunch` = BinsKiwiCrunch) |>
+  select(c(isoweek,`Te Ipu`,Sunfruit,`Kiwi Crunch`)) |>
+  pivot_longer(cols = c(`Te Ipu`,Sunfruit,`Kiwi Crunch`),
+               names_to = "Packing site",
+               values_to = "Bins tipped")
+
+SiteTipProgrammeLong |>
+  ggplot(aes(x=isoweek, y=`Bins tipped`, fill = `Packing site`)) +
+  geom_col(alpha = 0.6) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(legend.position = "top",
+        axis.title.x = element_text(margin = margin(t = 10), size = 10),
+        axis.title.y = element_text(margin = margin(r = 10), size = 10),
+        axis.text.y = element_text(size = 10, hjust=1),
+        axis.text.x = element_text(size = 10),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10),
+        strip.text = element_text(margin = margin(b=10), size = 10))
+
+
+```
+```{r}
+#| label: fig-ScenarioPacking
+#| fig-cap: "Draw down of RA and CA bins for the three packing scenarios. This is based on the packing programme shown in @fig-PackProgramme1"
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 1.1
+
+RemainingBinsRA <- BinsToGoSummaryTotal[[1,3]]
+RemainingBinsCA <- BinsToGoSummaryTotal[[1,2]]
+
+RemainingBinsRASc1 <- RemainingBinsRA-8000
+RemainingBinsRAsc2 <- RemainingBinsRA-10000
+
+
+PackProgramme <- function(SiteTipProgramme, RemainingRA, RemainingCA) {
+
+  for (i in 1:nrow(SiteTipProgramme)) {
+    if (i == 1) {
+      SiteTipProgramme$RemainingRABins[i] <-  {{RemainingRA}}-SiteTipProgramme$TotalBins[i]
+      SiteTipProgramme$RABinsTipped[i] <- SiteTipProgramme$TotalBins[i]
+    } else {
+      if (SiteTipProgramme$RemainingRABins[i-1]-SiteTipProgramme$TotalBins[i] >= 0) {
+        SiteTipProgramme$RemainingRABins[i] <-  SiteTipProgramme$RemainingRABins[i-1]-SiteTipProgramme$TotalBins[i]
+        SiteTipProgramme$RABinsTipped[i] <- SiteTipProgramme$TotalBins[i]
+      } else {
+        SiteTipProgramme$RemainingRABins[i-1] 
+        SiteTipProgramme$RABinsTipped[i] <-  SiteTipProgramme$RemainingRABins[i-1] 
+        break
+      }
+    }
+  }
+
+  for (j in 1:nrow(SiteTipProgramme)) {
+    if(SiteTipProgramme$RemainingRABins[j]>0 & SiteTipProgramme$RABinsTipped[j] == SiteTipProgramme$TotalBins[j]) {
+      SiteTipProgramme$RemainingCABins[j] <- {{RemainingCA}}
+      SiteTipProgramme$CABinsTipped[j] <- 0
+    } else if (SiteTipProgramme$RABinsTipped[j]>0 & SiteTipProgramme$RemainingRABins[j] == 0) {
+      SiteTipProgramme$RemainingCABins[j] <- RemainingBinsCA-(SiteTipProgramme$TotalBins[j]-SiteTipProgramme$RABinsTipped[j])
+      SiteTipProgramme$CABinsTipped[j] <- SiteTipProgramme$TotalBins[j]-SiteTipProgramme$RABinsTipped[j]
+    } else if (SiteTipProgramme$RABinsTipped[j] == 0 & SiteTipProgramme$RemainingRABins[j] == 0) {
+      if (SiteTipProgramme$RemainingCABins[j-1] >= SiteTipProgramme$TotalBins[j]) {
+        SiteTipProgramme$RemainingCABins[j] <- SiteTipProgramme$RemainingCABins[j-1]-SiteTipProgramme$TotalBins[j]
+        SiteTipProgramme$CABinsTipped[j] <- SiteTipProgramme$TotalBins[j]
+      } else {
+        SiteTipProgramme$RemainingCABins[j] <- 0
+        SiteTipProgramme$CABinsTipped[j] <- SiteTipProgramme$RemainingCABins[j-1]
+      }
+    } 
+  }
+  
+  return(SiteTipProgramme)
+  
+}
+
+#
+# Run Functions for the two scenarios (i.e. -5,000 and -10,000 bins)
+#
+PackProgrammeToGoBase <- PackProgramme(SiteTipProgramme, RemainingBinsRA, RemainingBinsCA)  
+PackProgrammeToGoSc1 <- PackProgramme(SiteTipProgramme, RemainingBinsRASc1, RemainingBinsCA)  
+PackProgrammeToGoSc2 <- PackProgramme(SiteTipProgramme, RemainingBinsRAsc2, RemainingBinsCA) 
+
+AddRow <- tibble(isoweek = 26,
+                 RemainingRABins = BinsToGoSummaryTotal[[1,3]],
+                 RemainingCABins = BinsToGoSummaryTotal[[1,2]])
+
+BaseRem <- PackProgrammeToGoBase |>
+  select(c(isoweek, RemainingRABins, RemainingCABins)) |>
+  bind_rows(AddRow) |> 
+  rename(CA = RemainingCABins,
+         RA = RemainingRABins) |>
+  pivot_longer(cols = c(RA, CA),
+               names_to = "Storage",
+               values_to = "bins") |>
+  mutate(Scenario = "Base")
+  
+Base8Rem <- PackProgrammeToGoSc1 |>
+  select(c(isoweek, RemainingRABins, RemainingCABins)) |>
+  bind_rows(AddRow) |> 
+  rename(CA = RemainingCABins,
+         RA = RemainingRABins) |>
+  pivot_longer(cols = c(RA, CA),
+               names_to = "Storage",
+               values_to = "bins") |>
+  mutate(Scenario = "Base-8,000")
+
+Base10Rem <- PackProgrammeToGoSc2 |>
+  select(c(isoweek, RemainingRABins, RemainingCABins)) |>
+  bind_rows(AddRow) |> 
+  rename(CA = RemainingCABins,
+         RA = RemainingRABins) |>
+  pivot_longer(cols = c(RA, CA),
+               names_to = "Storage",
+               values_to = "bins") |>
+  mutate(Scenario = "Base-10,000")
+
+BaseRem |>
+  bind_rows(Base8Rem) |>
+  bind_rows(Base10Rem) |>
+  mutate(Scenario = factor(Scenario, levels = c("Base","Base-8,000","Base-10,000"))) |>
+  ggplot(aes(x=isoweek, y=bins, colour = Storage)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Scenario, ncol=1) +
+  labs(x = "ISO week",
+       y = "Bins tipped") +
+  scale_y_continuous(labels = scales::label_comma(1.0)) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(legend.position = "top",
+        axis.title.x = element_text(margin = margin(t = 10), size = 10),
+        axis.title.y = element_text(margin = margin(r = 10), size = 10),
+        axis.text.y = element_text(size = 10, hjust=1),
+        axis.text.x = element_text(size = 10),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10),
+        strip.text = element_text(margin = margin(b=10), size = 10))
+```
+### Calculation of RA to CA transition for each packing scenario
+
+The theoretical transition from RA to CA fruit can be calculated for each scenario using the packing programme given in @fig-PackProgramme1.  These are listed in @tbl-RACATransition along with the minimum and maximum storage days for each of the different storage conditions.
+
+```{r}
+#| label: tbl-RACATransition
+#| tbl-cap: "Estimated CA start and finish weeks and minimum and maximum storage days for RA and CA packing programmes"
+
+
+StorageDayEstimates <- function(PackProgrammeToGo, WAHarvestDate, Scenario) {
+
+  FuturePackDataRA <- PackProgrammeToGo |>
+    filter(RABinsTipped > 0) |>
+    mutate(weekdate = str_c("2025-W",isoweek,"-3"),
+           PackDate = ISOweek::ISOweek2date(weekdate),
+           StorageDays = as.integer(PackDate-WAHarvestDate[[2,2]]))
+
+  FuturePackDataCA <- PackProgrammeToGo |>
+    filter(CABinsTipped > 0) |>
+    mutate(weekdate = str_c("2025-W",isoweek,"-3"),
+           PackDate = ISOweek::ISOweek2date(weekdate),
+           StorageDays = as.integer(PackDate-WAHarvestDate[[1,2]]))
+
+  StorageDayCuts <- tibble(`Storage type` = c("RA","CA"),
+                           StorageDays_Start = c(FuturePackDataRA$StorageDays[[1]],
+                                                FuturePackDataCA$StorageDays[[1]]),
+                           StorageDays_End = c(FuturePackDataRA$StorageDays[[nrow(FuturePackDataRA)]],
+                                           FuturePackDataCA$StorageDays[[nrow(FuturePackDataCA)]]),
+                           Scenario = {{Scenario}}) |>
+    ungroup()
+  
+  return(StorageDayCuts)
+
+}
+
+SDEBase <- StorageDayEstimates(PackProgrammeToGoBase,WAHarvestDate,"Base")
+SDESc1 <- StorageDayEstimates(PackProgrammeToGoSc1,WAHarvestDate,"Base-8,000")
+SDESc2 <- StorageDayEstimates(PackProgrammeToGoSc2,WAHarvestDate,"Base-10,000")
+
+WeekCABeginsEnds <- function(PackProgrammeToGo, Scenario) {
+  
+  FuturePackDataCA <- PackProgrammeToGo |>
+    filter(CABinsTipped > 0) 
+
+  WeekCABegins <- tibble(`CA start week` = FuturePackDataCA$isoweek[[1]],
+                         `CA finish week` = FuturePackDataCA$isoweek[[nrow(FuturePackDataCA)]],
+                           Scenario = {{Scenario}})
+  
+  return(WeekCABegins)
+  
+}
+
+CBBase <- WeekCABeginsEnds(PackProgrammeToGoBase,"Base")
+CBSc1 <- WeekCABeginsEnds(PackProgrammeToGoSc1,"Base-8,000")
+CBSc2 <- WeekCABeginsEnds(PackProgrammeToGoSc2,"Base-10,000")
+
+CB <- CBBase |>
+  bind_rows(CBSc1) |>
+  bind_rows(CBSc2) 
+
+SDEBase |>
+  bind_rows(SDESc1) |>
+  bind_rows(SDESc2) |>
+  pivot_wider(id_cols = Scenario,
+              names_from = `Storage type`,
+              values_from = c(StorageDays_Start,StorageDays_End)) |>
+  rename(`Storage days_RA_Start` = StorageDays_Start_RA,
+         `Storage days_RA_End` = StorageDays_End_RA,
+         `Storage days_CA_Start` = StorageDays_Start_CA,
+         `Storage days_CA_End` = StorageDays_End_CA) |>
+  relocate(`Storage days_RA_End`, .after = `Storage days_RA_Start`) |>
+  left_join(CB, by = "Scenario") |>
+  relocate(`CA start week`, .after = Scenario) |>
+  relocate(`CA finish week`, .after = `CA start week`) |>
+  rename(CA_Week_Start = `CA start week`,
+         CA_Week_End = `CA finish week`) |>
+  flextable::flextable() |>
+  flextable::separate_header() |>
+  flextable::bold(bold=T, part="header") |>
+  flextable::autofit() 
+
+```
+
+The gap between the end of the RA storage days and beginning of the CA storage days for each scenario is due to the fact that The weighted mean harvest date for CA fruit is `r round(as.numeric(WAHarvestDate[[2,2]]-WAHarvestDate[[1,2]]),0)` days earlier than for RA (@tbl-WAHarvestDates). Storage days should not be confused with packing date.
+
+The packout behaviour for the three different scenarios can be visualised and compared in @fig-ScenarioPackouts which shows the scatter of the batches already packed and the modeled RA and CA as lines.  Note the confidence intervals diverge for the RA storage days without much data.
+
+
+```{r}
+#| label: fig-ScenarioPackouts
+#| fig-cap: "Packout forecast as a function of storage days for RA and CA fruit.  Three packing scenarios described above are detailed"
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 1.1
+
+
+#
+# 2025 Data - This needs the season packout information
+#
+
+GBDTIRA2025 <- GBD |>
+  filter(`Packing site` == "Te Ipu Packhouse (RO)",
+         `Storage type` == "RA",
+         Season == 2025,
+         !is.na(RejectKgs)) |>
+  mutate(StorageDays = as.integer(PackDate-gbHarvestDate),
+         Packout = 1-RejectKgs/InputKgs) 
+
+StorageDaysRASc1 <- tibble(StorageDays = seq(0,166,1))
+
+NLmodel2025RA <- nls(Packout ~ alpha *exp(beta * StorageDays) + theta, 
+                     data=GBDTIRA2025, 
+                     start=list(alpha=0.247, beta=-.012, theta=0.7))
+
+#summary(NLmodel2025RA)
+
+yield.boot2025 <- nlstools::nlsBoot(NLmodel2025RA, niter = 999)
+meanPO2025 <- data.frame(estimate = predict(NLmodel2025RA,
+                                            newdata = StorageDaysRASc1))
+CIPO2025 <- data.frame(nlstools::nlsBootPredict(yield.boot2025, 
+                                                newdata = StorageDaysRASc1, 
+                                                interval = "confidence"))
+
+mean_curvePO2025RA <- StorageDaysRASc1 |> 
+  bind_cols(meanPO2025) |>
+  bind_cols(CIPO2025) |>
+  rename(low = X2.5.,
+         high = X97.5.) |>
+  mutate(Season = 2025) |>
+  select(-c(Median))
+
+# Generate synthetic data for 2025
+
+newdata <- StorageDaysRASc1
+
+meanPO2025syn <- data.frame(estimate = predict(NLmodel2025RA,
+                                               newdata = newdata)) |>
+  bind_cols(newdata) |>
+  mutate(Season = 2025,
+         `Storage type` = "RA")
+
+PackoutEndRA <- predict(NLmodel2025RA,newdata = tibble(StorageDays = 166))
+
+meanCAPO <- GBDTICA |>
+  summarise(meanModeledPO = mean(Packout, na.rm=T)) |>
+  mutate(CAUplift = meanModeledPO-summary(NLmodel2024)$coef[[3,1]])
+
+modelCAPO2025 <- tibble(StorageDays = seq(166,264,1)) |>
+  mutate(Packout = PackoutEndRA+meanCAPO$CAUplift[[1]],
+         Season = 2025,
+         `Storage type` = "CA")
+
+
+
+POPlotRA <- function(NLmodel2025RA, yield.boot2025, SDE, Scenario) {
+  
+  StorageDaysRA <- tibble(StorageDays = seq(0,SDE[[1,3]],1))
+
+  meanPO2025 <- data.frame(estimate = predict(NLmodel2025RA,
+                                            newdata = StorageDaysRA))
+  CIPO2025 <- data.frame(nlstools::nlsBootPredict(yield.boot2025, 
+                                                newdata = StorageDaysRA, 
+                                                interval = "confidence"))
+
+  mean_curvePO2025RA <- StorageDaysRA |> 
+    bind_cols(meanPO2025) |>
+    bind_cols(CIPO2025) |>
+    rename(low = X2.5.,
+           high = X97.5.) |>
+    mutate(Season = 2025,
+           `Storage type` = "RA",
+           Scenario = {{Scenario}})
+  
+  return(mean_curvePO2025RA)
+
+}
+  
+POPlotRABase <- POPlotRA(NLmodel2025RA, yield.boot2025, SDEBase, "Base")
+POPlotRASc1 <- POPlotRA(NLmodel2025RA, yield.boot2025, SDESc1, "Base-8,000")
+POPlotRASc2 <- POPlotRA(NLmodel2025RA, yield.boot2025, SDESc2, "Base-10,000")
+
+POPlotRA <- POPlotRABase |>
+  bind_rows(POPlotRASc1) |>
+  bind_rows(POPlotRASc2) |>
+  mutate(Scenario = factor(Scenario, levels = c("Base","Base-8,000","Base-10,000")))
+#
+# make plot for the scattergraph
+#
+POAnalysisRASc1 <- GBDTIRA2025 |>
+  mutate(Scenario = "Base-8,000") 
+
+POAnalysisRASc2 <- GBDTIRA2025 |>
+  mutate(Scenario = "Base-10,000") 
+
+POAnalysisRA <- GBDTIRA2025 |>
+  mutate(Scenario = "Base") |>
+  bind_rows(POAnalysisRASc1) |>
+  bind_rows(POAnalysisRASc2) |>
+  mutate(Scenario = factor(Scenario, levels = c("Base","Base-8,000","Base-10,000")))
+
+EndRABase <- tibble(StorageDays = predict(NLmodel2025RA, newdata = SDEBase[1,3] |> rename(StorageDays = StorageDays_End)))
+EndRASc1 <- tibble(StorageDays = predict(NLmodel2025RA, newdata = SDESc1[1,3] |> rename(StorageDays = StorageDays_End)))
+EndRASc2 <- tibble(StorageDays = predict(NLmodel2025RA, newdata = SDESc2[1,3] |> rename(StorageDays = StorageDays_End)))
+
+CA2025Base = EndRABase + meanCAPO$CAUplift[[1]]
+CA2025Sc1 = EndRASc1 + meanCAPO$CAUplift[[1]]
+CA2025Sc2 = EndRASc2 + meanCAPO$CAUplift[[1]]
+
+CA2025PO <- CA2025Base |>
+  bind_rows(CA2025Sc1) |>
+  bind_rows(CA2025Sc2) |>
+  mutate(Scenario = c("Base", "Base-8,000", "Base-10,000"))
+
+#
+# Generate the CA Data frames
+#
+
+CAPO2025Sc1 <- tibble(StorageDays = seq(SDESc1[[2,2]],SDESc1[[2,3]],1),
+                    Packout = CA2025Sc1[[1]],
+                    Scenario = "Base-8,000")
+
+CAPO2025Sc2 <- tibble(StorageDays = seq(SDESc2[[2,2]],SDESc2[[2,3]],1),
+                    Packout = CA2025Sc2[[1]],
+                    Scenario = "Base-10,000")
+
+
+CAPO2025 <- tibble(StorageDays = seq(SDEBase[[2,2]],SDEBase[[2,3]],1),
+                 Packout = CA2025Base[[1]],
+                 Scenario = "Base") |>
+  bind_rows(CAPO2025Sc1) |>
+  bind_rows(CAPO2025Sc2) |>
+  mutate(Scenario = factor(Scenario, levels = c("Base","Base-8,000","Base-10,000")))
+
+POPlotRA |>
+  ggplot() +
+  geom_line(aes(StorageDays, estimate),colour = "#48762e", linewidth=1) +
+  facet_wrap(~Scenario, ncol = 1) +
+  geom_ribbon(aes(x=StorageDays, ymin = low, ymax = high, group = factor(Season)), fill="grey50", alpha=0.5) +
+  geom_point(data = POAnalysisRA, aes(x=StorageDays, y=Packout), colour = "#48762e", alpha=0.4) +
+  geom_line(data = CAPO2025, aes(StorageDays, Packout), colour = "#a9342c", linewidth = 1) +
+  scale_y_continuous("Packout / %", labels = scales::label_percent(1.0)) +
+  labs(x = "Storage days") +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(legend.position = "top",
+        axis.title.x = element_text(margin = margin(t = 10), size = 10),
+        axis.title.y = element_text(margin = margin(r = 10), size = 10),
+        axis.text.y = element_text(size = 10, hjust=1),
+        axis.text.x = element_text(size = 10),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10),
+        strip.text = element_text(margin = margin(b=10), size = 10))
+```
+## Seasonal packout prediction
+
+Based on the above analysis, a seasonal packout can be estimated by adding the three phases of the model:
+
+1. RA fruit already packed (i.e. actual packout)
+2. RA fruit yet to be packed (modeled using the non-linear function) 
+3. CA fruit yet to be packed 
+
+In terms of timing of the various phases of packing these are listed in @tbl-RACATransition. The input and export mass (export mass = input mass - reject mass) are listed in @tbl-inputexportmass for each of the three phases and packing scenarios.  The final estimated seasonal packout is given in @tbl-finalPackout. The seasonal result is calculated by summing the input and export masses for each of the packing phases and the calculating the packout on the aggregated total.  As expected the net packout increases as the bins decrease.
+
+```{r}
+#| label: tbl-inputexportmass
+#| tbl-cap: "Input and Export mass for the three phases of the packing model and the three packing scenarios"
+
+BinsTippedTable <- BinsTippedFinalSummaryTotal |>
+  mutate(`Already packed_Input_tonnes` = InputKgs/1000,
+         `Already packed_Reject_tonnes` = RejectKgs/1000,
+         `Already packed_Export_tonnes` = `Already packed_Input_tonnes`-`Already packed_Reject_tonnes`,
+         `Already packed_Packout_%` =  `Already packed_Export_tonnes`/`Already packed_Input_tonnes`) |>
+  select(c(`Already packed_Input_tonnes`,`Already packed_Export_tonnes`,`Already packed_Packout_%`))
+
+FuturePackSummary <- function(PackProgrammeToGo,WAHarvestDate,WAMassPerBin,NLmodel2025RA) {
+  
+  FuturePackDataRA <- PackProgrammeToGo |>
+    filter(RABinsTipped > 0) |>
+    mutate(weekdate = str_c("2025-W",isoweek,"-3"),
+           PackDate = ISOweek::ISOweek2date(weekdate),
+           StorageDays = as.integer(PackDate-WAHarvestDate[[2,2]]),
+           CumBinsTipped = cumsum(RABinsTipped),
+           InputKgs = RABinsTipped*WAMassPerBin[[1,1]])
+  
+  Packout <- tibble(Packout = predict(NLmodel2025RA, newdata = tibble(StorageDays = FuturePackDataRA$StorageDays))) 
+  
+  FinalFuturePackDatesRA <- FuturePackDataRA |>
+    bind_cols(Packout) |>
+    mutate(ExportKgs = Packout*InputKgs) |>
+    select(c(PackDate,StorageDays,RABinsTipped,InputKgs,ExportKgs)) 
+  
+  return(FinalFuturePackDatesRA)
+  
+}
+
+FPSRABase <- FuturePackSummary(PackProgrammeToGoBase,WAHarvestDate,WAMassPerBin,NLmodel2025RA)
+FPSRASc1 <- FuturePackSummary(PackProgrammeToGoSc1,WAHarvestDate,WAMassPerBin,NLmodel2025RA)
+FPSRASc2 <- FuturePackSummary(PackProgrammeToGoSc2,WAHarvestDate,WAMassPerBin,NLmodel2025RA)
+
+################################################################################################
+#                                       Include the CA component                               #
+################################################################################################
+
+CABinsToGoRaw <- BinsToGoSummaryTotal |>
+  mutate(`CA to go_Input_tonnes` = CA*WAMassPerBin[[1,1]]/1000) |>
+  select(`CA to go_Input_tonnes`)
+
+POCalculationBase <- BinsTippedTable |>
+  mutate(Scenario = "Base") |>
+  relocate(Scenario, .before = `Already packed_Input_tonnes`) |>
+  bind_cols(FPSRABase |>
+              ungroup() |>
+              summarise(`RA to go_Input_tonnes` = sum(InputKgs)/1000,
+                        `RA to go_Export_tonnes` = sum(ExportKgs)/1000) |>
+              mutate(`RA to go_Packout_%` = `RA to go_Export_tonnes`/`RA to go_Input_tonnes`)) |>
+  bind_cols(CABinsToGoRaw |>
+              mutate(`CA to go_Packout_%` = CA2025Base[[1,1]],
+                     `CA to go_Export_tonnes` = `CA to go_Packout_%`*`CA to go_Input_tonnes`) |>
+              select(`CA to go_Input_tonnes`,`CA to go_Export_tonnes`,`CA to go_Packout_%`))
+
+POCalculationSc1 <- BinsTippedTable |>
+  mutate(Scenario = "Base-8,000") |>
+  relocate(Scenario, .before = `Already packed_Input_tonnes`) |>
+  bind_cols(FPSRASc1 |>
+              ungroup() |>
+              summarise(`RA to go_Input_tonnes` = sum(InputKgs)/1000,
+                        `RA to go_Export_tonnes` = sum(ExportKgs)/1000) |>
+              mutate(`RA to go_Packout_%` = `RA to go_Export_tonnes`/`RA to go_Input_tonnes`)) |>
+  bind_cols(CABinsToGoRaw |>
+              mutate(`CA to go_Packout_%` = CA2025Sc1[[1,1]],
+                     `CA to go_Export_tonnes` = `CA to go_Packout_%`*`CA to go_Input_tonnes`) |>
+              select(`CA to go_Input_tonnes`,`CA to go_Export_tonnes`,`CA to go_Packout_%`))
+
+POCalculationSc2 <- BinsTippedTable |>
+  mutate(Scenario = "Base-10,000") |>
+  relocate(Scenario, .before = `Already packed_Input_tonnes`) |>
+  bind_cols(FPSRASc2 |>
+              ungroup() |>
+              summarise(`RA to go_Input_tonnes` = sum(InputKgs)/1000,
+                        `RA to go_Export_tonnes` = sum(ExportKgs)/1000) |>
+              mutate(`RA to go_Packout_%` = `RA to go_Export_tonnes`/`RA to go_Input_tonnes`)) |>
+  bind_cols(CABinsToGoRaw |>
+              mutate(`CA to go_Packout_%` = CA2025Sc2[[1,1]],
+                     `CA to go_Export_tonnes` = `CA to go_Packout_%`*`CA to go_Input_tonnes`) |>
+              select(`CA to go_Input_tonnes`,`CA to go_Export_tonnes`,`CA to go_Packout_%`))
+
+POAssembly <- POCalculationBase |>
+  bind_rows(POCalculationSc1) |>
+  bind_rows(POCalculationSc2)
+
+POAssembly |>
+  mutate(across(.cols = c(`Already packed_Input_tonnes`,`Already packed_Export_tonnes`,`RA to go_Input_tonnes`,
+                          `RA to go_Export_tonnes`,`CA to go_Input_tonnes`,`CA to go_Export_tonnes`),
+                ~scales::comma(.,0.1)),
+         across(.cols = c(`Already packed_Packout_%`,`RA to go_Packout_%`,`CA to go_Packout_%`),
+                ~scales::percent(.,0.1))) |>
+  flextable::flextable() |>
+  flextable::separate_header() |>
+  flextable::align(j=c(2:10), align = "right", part = "body") |>
+  flextable::align(j=c(2:10), align = "center", part = "header") |>
+  flextable::fit_to_width(max_width = 6) |>
+  flextable::bold(bold = T, part = "header") |>
+  flextable::autofit()
+
+```
+
+```{r}
+#| label: tbl-finalPackout
+#| tbl-cap: "Final seasonal packout for each of the different scenarios defined above"
+
+POAssembly |>
+  mutate(Seasonal_Input_tonnes = `Already packed_Input_tonnes`+`RA to go_Input_tonnes`+`CA to go_Input_tonnes`,
+         Seasonal_Export_tonnes = `Already packed_Export_tonnes`+`RA to go_Export_tonnes`+`CA to go_Export_tonnes`,
+         `Seasonal_Packout_%` = Seasonal_Export_tonnes/Seasonal_Input_tonnes,
+         across(.cols = c(Seasonal_Input_tonnes,Seasonal_Export_tonnes), ~scales::comma(.,0.1)),
+         `Seasonal_Packout_%` = scales::percent(`Seasonal_Packout_%`,0.1)) |>
+  select(c(Scenario,Seasonal_Input_tonnes,Seasonal_Export_tonnes,`Seasonal_Packout_%`)) |>
+  flextable::flextable() |>
+  flextable::separate_header() |>
+  flextable::align(j=c(2:4), align="right", part = "body") |>
+  flextable::align(j=c(2:4), align = "center", part = "header") |>
+  flextable::bold(bold = T, part = "header") |>
+  flextable::autofit()
+
+```
+
